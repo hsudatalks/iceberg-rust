@@ -219,6 +219,21 @@ impl Table {
         self.object_cache.clone()
     }
 
+    /// Read the selected snapshot's manifest list and manifests into the table cache.
+    pub async fn validate_manifests(&self, snapshot_id: i64) -> Result<()> {
+        let snapshot = self.metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+            Error::new(ErrorKind::DataInvalid, format!("missing snapshot {snapshot_id}"))
+        })?;
+        let list = self.object_cache.get_manifest_list(snapshot, &self.metadata).await?;
+        for manifest in list.entries() {
+            let manifest = self.object_cache.get_manifest(manifest).await?;
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                self.file_io.new_input(entry.data_file().file_path())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a table scan.
     pub fn scan(&self) -> TableScanBuilder<'_> {
         TableScanBuilder::new(self)

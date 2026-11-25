@@ -202,13 +202,14 @@ impl Snapshot {
         file_io: &FileIO,
         table_metadata: &TableMetadata,
     ) -> Result<ManifestList> {
-        let manifest_list_content = file_io.new_input(&self.manifest_list)?.read().await?;
+        let input = file_io.new_input(&self.manifest_list)?;
+        let manifest_list_content = input.read().await?;
         ManifestList::parse_with_version(
             &manifest_list_content,
             // TODO: You don't really need the version since you could just project any Avro in
             // the version that you'd like to get (probably always the latest)
             table_metadata.format_version(),
-        )
+        ).map_err(|error| error.with_context("manifest list", input.location()))
     }
 
     #[allow(dead_code)]

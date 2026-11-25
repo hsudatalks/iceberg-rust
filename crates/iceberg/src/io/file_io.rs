@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::borrow::Cow;
 use std::ops::Range;
+use std::path::{Component, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
@@ -66,6 +68,7 @@ pub struct FileIO {
     factory: Arc<dyn StorageFactory>,
     /// Cached storage instance (lazily initialized)
     storage: Arc<OnceLock<Arc<dyn Storage>>>,
+    local_read_root: Option<Arc<PathBuf>>,
 }
 
 impl FileIO {
@@ -77,6 +80,7 @@ impl FileIO {
             config: StorageConfig::new(),
             factory: Arc::new(MemoryStorageFactory),
             storage: Arc::new(OnceLock::new()),
+            local_read_root: None,
         }
     }
 
@@ -88,7 +92,34 @@ impl FileIO {
             config: StorageConfig::new(),
             factory: Arc::new(LocalFsStorageFactory),
             storage: Arc::new(OnceLock::new()),
+            local_read_root: None,
         }
+    }
+
+    /// Resolve warehouse-relative Iceberg paths at the filesystem boundary.
+    pub fn with_local_root(mut self, root: PathBuf) -> Self {
+        self.local_read_root = Some(Arc::new(root));
+        self
+    }
+
+    fn resolve_input<'a>(&self, location: &'a str) -> Result<Cow<'a, str>> {
+        let Some(root) = self.local_read_root.as_deref() else {
+            return Ok(Cow::Borrowed(location));
+        };
+        let path = std::path::Path::new(location);
+        if path.is_absolute() || location.starts_with("file:") || location.contains("://") {
+            return Err(crate::Error::new(
+                crate::ErrorKind::DataInvalid,
+                "Iceberg path must be warehouse-relative; stop the writer and run python3 scripts/migrate_to_current.py WAREHOUSE --private-copy",
+            ).with_context("path", location));
+        }
+        if location.is_empty() || path.components().any(|part| matches!(part, Component::ParentDir)) {
+            return Err(crate::Error::new(crate::ErrorKind::DataInvalid, "Invalid local Iceberg input path")
+                .with_context("path", location));
+        }
+        root.join(path).into_os_string().into_string().map(Cow::Owned).map_err(|_| {
+            crate::Error::new(crate::ErrorKind::DataInvalid, "Resolved Iceberg input path is not UTF-8")
+        })
     }
 
     /// Get the storage configuration.
@@ -122,7 +153,7 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn delete(&self, path: impl AsRef<str>) -> Result<()> {
-        self.get_storage()?.delete(path.as_ref()).await
+        self.get_storage()?.delete(&self.resolve_input(path.as_ref())?).await
     }
 
     /// Remove the path and all nested dirs and files recursively.
@@ -137,7 +168,7 @@ impl FileIO {
     /// - If the path is a empty directory, this function will remove the directory itself.
     /// - If the path is a non-empty directory, this function will remove the directory and all nested files and directories.
     pub async fn delete_prefix(&self, path: impl AsRef<str>) -> Result<()> {
-        self.get_storage()?.delete_prefix(path.as_ref()).await
+        self.get_storage()?.delete_prefix(&self.resolve_input(path.as_ref())?).await
     }
 
     /// Check file exists.
@@ -146,7 +177,7 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub async fn exists(&self, path: impl AsRef<str>) -> Result<bool> {
-        self.get_storage()?.exists(path.as_ref()).await
+        self.get_storage()?.exists(&self.resolve_input(path.as_ref())?).await
     }
 
     /// Creates input file.
@@ -155,7 +186,7 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_input(&self, path: impl AsRef<str>) -> Result<InputFile> {
-        self.get_storage()?.new_input(path.as_ref())
+        self.get_storage()?.new_input(&self.resolve_input(path.as_ref())?)
     }
 
     /// Creates output file.
@@ -164,7 +195,11 @@ impl FileIO {
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
     pub fn new_output(&self, path: impl AsRef<str>) -> Result<OutputFile> {
-        self.get_storage()?.new_output(path.as_ref())
+        let mut output = self.get_storage()?.new_output(&self.resolve_input(path.as_ref())?)?;
+        if self.local_read_root.is_some() {
+            output.reference = Some(path.as_ref().to_owned());
+        }
+        Ok(output)
     }
 }
 
@@ -217,6 +252,7 @@ impl FileIOBuilder {
             config: self.config,
             factory: self.factory,
             storage: Arc::new(OnceLock::new()),
+            local_read_root: None,
         }
     }
 }
@@ -308,6 +344,7 @@ pub trait FileWrite: Send + Unpin + 'static {
 /// Output file is used for writing to files..
 #[derive(Debug)]
 pub struct OutputFile {
+    reference: Option<String>,
     storage: Arc<dyn Storage>,
     // Absolute path of file.
     path: String,
@@ -316,12 +353,12 @@ pub struct OutputFile {
 impl OutputFile {
     /// Creates a new output file.
     pub fn new(storage: Arc<dyn Storage>, path: String) -> Self {
-        Self { storage, path }
+        Self { storage, path, reference: None }
     }
 
     /// Relative path to root uri.
     pub fn location(&self) -> &str {
-        &self.path
+        self.reference.as_deref().unwrap_or(&self.path)
     }
 
     /// Checks if file exists.

@@ -18,8 +18,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use tokio::sync::Notify;
-use tokio::sync::oneshot::Receiver;
+use tokio::sync::{watch, Notify};
 
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
@@ -27,12 +26,6 @@ use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
 use crate::spec::DataContentType;
 use crate::{Error, ErrorKind, Result};
-
-#[derive(Debug)]
-enum EqDelState {
-    Loading(Arc<Notify>),
-    Loaded(Predicate),
-}
 
 /// State tracking for positional delete files.
 /// Unlike equality deletes, positional deletes must be fully loaded before
@@ -49,7 +42,7 @@ enum PosDelState {
 #[derive(Debug, Default)]
 struct DeleteFileFilterState {
     delete_vectors: HashMap<String, Arc<Mutex<DeleteVector>>>,
-    equality_deletes: HashMap<String, EqDelState>,
+    equality_deletes: HashMap<String, watch::Receiver<Option<Predicate>>>,
     positional_deletes: HashMap<String, PosDelState>,
 }
 
@@ -90,21 +83,17 @@ impl DeleteFilter {
             .and_then(|st| st.delete_vectors.get(data_file_path).cloned())
     }
 
-    pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<Arc<Notify>> {
+    pub(crate) fn try_start_eq_del_load(&self, file_path: &str) -> Option<watch::Sender<Option<Predicate>>> {
         let mut state = self.state.write().unwrap();
-
-        // Skip if already loaded/loading - another task owns it
-        if state.equality_deletes.contains_key(file_path) {
-            return None;
+        if let Some(previous) = state.equality_deletes.get(file_path) {
+            // Reuse an active loader or a completed predicate. A cancelled load can be retried.
+            if previous.has_changed().is_ok() || previous.borrow().is_some() {
+                return None;
+            }
         }
-
-        // Mark as loading to prevent duplicate work
-        let notifier = Arc::new(Notify::new());
-        state
-            .equality_deletes
-            .insert(file_path.to_string(), EqDelState::Loading(notifier.clone()));
-
-        Some(notifier)
+        let (sender, receiver) = watch::channel(None);
+        state.equality_deletes.insert(file_path.to_owned(), receiver);
+        Some(sender)
     }
 
     /// Attempts to mark a positional delete file as "loading".
@@ -152,23 +141,15 @@ impl DeleteFilter {
     pub(crate) async fn get_equality_delete_predicate_for_delete_file_path(
         &self,
         file_path: &str,
-    ) -> Option<Predicate> {
-        let notifier = {
-            match self.state.read().unwrap().equality_deletes.get(file_path) {
-                None => return None,
-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
-                Some(EqDelState::Loaded(predicate)) => {
-                    return Some(predicate.clone());
-                }
-            }
-        };
-
-        notifier.notified().await;
-
-        match self.state.read().unwrap().equality_deletes.get(file_path) {
-            Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
-            _ => unreachable!("Cannot be any other state than loaded"),
-        }
+    ) -> Result<Option<Predicate>> {
+        let receiver = self.state.read().unwrap().equality_deletes.get(file_path).cloned();
+        let Some(mut receiver) = receiver else { return Ok(None) };
+        let predicate = receiver.wait_for(Option::is_some).await.map_err(|error| {
+            Error::new(ErrorKind::Unexpected, "Equality delete load was cancelled")
+                .with_retryable(true)
+                .with_source(error)
+        })?;
+        Ok(predicate.clone())
     }
 
     /// Builds eq delete predicate for the provided task.
@@ -189,7 +170,7 @@ impl DeleteFilter {
 
             let Some(predicate) = self
                 .get_equality_delete_predicate_for_delete_file_path(&delete.file_path)
-                .await
+                .await?
             else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -229,33 +210,6 @@ impl DeleteFilter {
         *entry.lock().unwrap() |= delete_vector;
     }
 
-    pub(crate) fn insert_equality_delete(
-        &self,
-        delete_file_path: &str,
-        eq_del: Receiver<Predicate>,
-    ) {
-        let notify = Arc::new(Notify::new());
-        {
-            let mut state = self.state.write().unwrap();
-            state.equality_deletes.insert(
-                delete_file_path.to_string(),
-                EqDelState::Loading(notify.clone()),
-            );
-        }
-
-        let state = self.state.clone();
-        let delete_file_path = delete_file_path.to_string();
-        crate::runtime::spawn(async move {
-            let eq_del = eq_del.await.unwrap();
-            {
-                let mut state = state.write().unwrap();
-                state
-                    .equality_deletes
-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
-            }
-            notify.notify_waiters();
-        });
-    }
 }
 
 pub(crate) fn is_equality_delete(f: &FileScanTaskDeleteFile) -> bool {
@@ -285,6 +239,22 @@ pub(crate) mod tests {
 
     const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: u64 = 2147483546;
     const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
+
+    #[tokio::test]
+    async fn cancelled_equality_load_wakes_readers_and_allows_retry() {
+        let filter = DeleteFilter::default();
+        let path = "cancelled.parquet";
+        let loader = filter.try_start_eq_del_load(path).unwrap();
+        let reader = filter.get_equality_delete_predicate_for_delete_file_path(path);
+        futures::pin_mut!(reader);
+        assert!(futures::poll!(&mut reader).is_pending());
+        drop(loader);
+        assert!(reader.await.unwrap_err().retryable());
+
+        let retry = filter.try_start_eq_del_load(path).unwrap();
+        retry.send(Some(AlwaysTrue)).unwrap();
+        assert_eq!(filter.get_equality_delete_predicate_for_delete_file_path(path).await.unwrap(), Some(AlwaysTrue));
+    }
 
     #[tokio::test]
     async fn test_delete_file_filter_load_deletes() {
@@ -414,6 +384,8 @@ pub(crate) mod tests {
 
         let file_scan_tasks = vec![
             FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: 0,
                 start: 0,
                 length: 0,
@@ -430,6 +402,8 @@ pub(crate) mod tests {
                 case_sensitive: false,
             },
             FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: 0,
                 start: 0,
                 length: 0,
@@ -481,6 +455,8 @@ pub(crate) mod tests {
 
         // ---------- fake FileScanTask ----------
         let task = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             file_size_in_bytes: 0,
             start: 0,
             length: 0,
@@ -508,10 +484,9 @@ pub(crate) mod tests {
         // ---------- insert equality delete predicate ----------
         let pred = Reference::new("id").equal_to(Datum::long(10));
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete("eq-del.parquet", rx);
+        let tx = filter.try_start_eq_del_load("eq-del.parquet").unwrap();
 
-        tx.send(pred).unwrap();
+        tx.send(Some(pred)).unwrap();
 
         // ---------- should FAIL ----------
         let result = filter.build_equality_delete_predicate(&task).await;

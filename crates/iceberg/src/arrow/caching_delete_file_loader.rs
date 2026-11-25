@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
 use futures::{StreamExt, TryStreamExt};
-use tokio::sync::oneshot::{Receiver, channel};
+use tokio::task::JoinHandle;
 
 use super::delete_filter::{DeleteFilter, PosDelLoadAction};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
@@ -59,7 +59,7 @@ enum DeleteFileContext {
     FreshEqDel {
         batch_stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
-        sender: tokio::sync::oneshot::Sender<Predicate>,
+        sender: tokio::sync::watch::Sender<Option<Predicate>>,
     },
 }
 
@@ -152,9 +152,7 @@ impl CachingDeleteFileLoader {
         &self,
         delete_file_entries: &[FileScanTaskDeleteFile],
         schema: SchemaRef,
-    ) -> Receiver<Result<DeleteFilter>> {
-        let (tx, rx) = channel();
-
+    ) -> JoinHandle<Result<DeleteFilter>> {
         let stream_items = delete_file_entries
             .iter()
             .map(|t| {
@@ -172,47 +170,40 @@ impl CachingDeleteFileLoader {
         let concurrency_limit_data_files = self.concurrency_limit_data_files;
         let basic_delete_file_loader = self.basic_delete_file_loader.clone();
         crate::runtime::spawn(async move {
-            let result = async move {
-                let mut del_filter = del_filter;
-                let basic_delete_file_loader = basic_delete_file_loader.clone();
+            let mut del_filter = del_filter;
+            let basic_delete_file_loader = basic_delete_file_loader.clone();
 
-                let mut results_stream = task_stream
-                    .map(move |(task, file_io, del_filter, schema)| {
-                        let basic_delete_file_loader = basic_delete_file_loader.clone();
-                        async move {
-                            Self::load_file_for_task(
-                                &task,
-                                basic_delete_file_loader.clone(),
-                                del_filter,
-                                schema,
-                            )
-                            .await
-                        }
-                    })
-                    .map(move |ctx| {
-                        Ok(async { Self::parse_file_content_for_task(ctx.await?).await })
-                    })
-                    .try_buffer_unordered(concurrency_limit_data_files);
-
-                while let Some(item) = results_stream.next().await {
-                    let item = item?;
-                    if let ParsedDeleteFileContext::DelVecs { file_path, results } = item {
-                        for (data_file_path, delete_vector) in results.into_iter() {
-                            del_filter.upsert_delete_vector(data_file_path, delete_vector);
-                        }
-                        // Mark the positional delete file as fully loaded so waiters can proceed
-                        del_filter.finish_pos_del_load(&file_path);
+            let mut results_stream = task_stream
+                .map(move |(task, file_io, del_filter, schema)| {
+                    let basic_delete_file_loader = basic_delete_file_loader.clone();
+                    async move {
+                        Self::load_file_for_task(
+                            &task,
+                            basic_delete_file_loader.clone(),
+                            del_filter,
+                            schema,
+                        )
+                        .await
                     }
+                })
+                .map(move |ctx| {
+                    Ok(async { Self::parse_file_content_for_task(ctx.await?).await })
+                })
+                .try_buffer_unordered(concurrency_limit_data_files);
+
+            while let Some(item) = results_stream.next().await {
+                let item = item?;
+                if let ParsedDeleteFileContext::DelVecs { file_path, results } = item {
+                    for (data_file_path, delete_vector) in results.into_iter() {
+                        del_filter.upsert_delete_vector(data_file_path, delete_vector);
+                    }
+                    // Mark the positional delete file as fully loaded so waiters can proceed
+                    del_filter.finish_pos_del_load(&file_path);
                 }
-
-                Ok(del_filter)
             }
-            .await;
 
-            let _ = tx.send(result);
-        });
-
-        rx
+            Ok(del_filter)
+        })
     }
 
     async fn load_file_for_task(
@@ -242,12 +233,9 @@ impl CachingDeleteFileLoader {
             }
 
             DataContentType::EqualityDeletes => {
-                let Some(notify) = del_filter.try_start_eq_del_load(&task.file_path) else {
+                let Some(sender) = del_filter.try_start_eq_del_load(&task.file_path) else {
                     return Ok(DeleteFileContext::ExistingEqDel);
                 };
-
-                let (sender, receiver) = channel();
-                del_filter.insert_equality_delete(&task.file_path, receiver);
 
                 // Per the Iceberg spec, evolve schema for equality deletes but only for the
                 // equality_ids columns, not all table columns.
@@ -298,7 +286,7 @@ impl CachingDeleteFileLoader {
                         .await?;
 
                 sender
-                    .send(predicate)
+                    .send(Some(predicate))
                     .map_err(|err| {
                         Error::new(
                             ErrorKind::Unexpected,
@@ -929,6 +917,8 @@ mod tests {
         };
 
         let file_scan_task = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             file_size_in_bytes: 0,
             start: 0,
             length: 0,

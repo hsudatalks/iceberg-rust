@@ -812,6 +812,11 @@ pub(crate) fn create_primitive_array_repeated(
     prim_lit: &Option<PrimitiveLiteral>,
     num_rows: usize,
 ) -> Result<ArrayRef> {
+    // Optional fields added after the file was written have no initial value.
+    // Arrow handles the full nested type, including the element field metadata.
+    if prim_lit.is_none() {
+        return Ok(arrow_array::new_null_array(data_type, num_rows));
+    }
     Ok(match (data_type, prim_lit) {
         (DataType::Boolean, Some(PrimitiveLiteral::Boolean(value))) => {
             Arc::new(BooleanArray::from(vec![*value; num_rows]))

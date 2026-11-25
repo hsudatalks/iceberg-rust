@@ -394,7 +394,7 @@ impl TableScan {
                         spawn(async move {
                             Self::process_delete_manifest_entry(manifest_entry_context, tx).await
                         })
-                        .await
+                        .await?
                     },
                 )
                 .await;
@@ -405,7 +405,7 @@ impl TableScan {
                     .await;
             }
         })
-        .await;
+        .await?;
 
         // Process the data file [`ManifestEntry`] stream in parallel
         spawn(async move {
@@ -417,7 +417,7 @@ impl TableScan {
                         spawn(async move {
                             Self::process_data_manifest_entry(manifest_entry_context, tx).await
                         })
-                        .await
+                        .await?
                     },
                 )
                 .await;
@@ -767,6 +767,7 @@ pub mod tests {
                                 .partition_spec_id(0)
                                 .content(DataContentType::Data)
                                 .file_path(format!("{}/1.parquet", &self.table_location))
+                                .sort_order_id(1)
                                 .file_format(DataFileFormat::Parquet)
                                 .file_size_in_bytes(parquet_file_size)
                                 .record_count(1)
@@ -1268,6 +1269,9 @@ pub mod tests {
         assert_eq!(tasks.len(), 2);
 
         tasks.sort_by_key(|t| t.data_file_path.to_string());
+
+        assert_eq!(tasks[0].sort_order_id, Some(1));
+        assert_eq!(tasks[1].sort_order_id, None);
 
         // Check first task is added data file
         assert_eq!(
@@ -1773,6 +1777,8 @@ pub mod tests {
                 .unwrap(),
         );
         let task = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             data_file_path: "data_file_path".to_string(),
             file_size_in_bytes: 0,
             start: 0,
@@ -1792,6 +1798,8 @@ pub mod tests {
 
         // with predicate
         let task = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             data_file_path: "data_file_path".to_string(),
             file_size_in_bytes: 0,
             start: 0,

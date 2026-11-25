@@ -135,7 +135,7 @@ impl ObjectCache {
         let key = CachedObjectKey::ManifestList((
             snapshot.manifest_list().to_string(),
             table_metadata.format_version,
-            snapshot.schema_id().unwrap(),
+            snapshot.schema_id().unwrap_or_else(|| table_metadata.current_schema_id()),
         ));
         let cache_entry = self
             .cache

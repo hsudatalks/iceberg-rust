@@ -117,6 +117,8 @@ impl ManifestEntryContext {
             .await;
 
         Ok(FileScanTask {
+            data_sequence_number: self.manifest_entry.sequence_number(),
+            sort_order_id: self.manifest_entry.data_file().sort_order_id(),
             file_size_in_bytes: self.manifest_entry.file_size_in_bytes(),
             start: 0,
             length: self.manifest_entry.file_size_in_bytes(),

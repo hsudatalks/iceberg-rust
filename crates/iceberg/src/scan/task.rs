@@ -51,6 +51,12 @@ where D: serde::Deserializer<'de> {
 /// A task to scan part of file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileScanTask {
+    /// Original data sequence, preserved when a data file is rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_sequence_number: Option<i64>,
+    /// Sort order declared by the data file's manifest entry, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order_id: Option<i32>,
     /// The total size of the data file in bytes, from the manifest entry.
     /// Used to skip a stat/HEAD request when reading Parquet footers.
     pub file_size_in_bytes: u64,

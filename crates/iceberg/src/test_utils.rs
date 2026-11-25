@@ -41,9 +41,9 @@ pub fn check_record_batches(
     assert!(!record_batches.is_empty(), "Empty record batches");
 
     // Combine record batches using the first batch's schema
-    let first_batch = record_batches.first().unwrap();
+    let batch_at_start = record_batches.first().unwrap();
     let record_batch =
-        arrow_select::concat::concat_batches(&first_batch.schema(), &record_batches).unwrap();
+        arrow_select::concat::concat_batches(&batch_at_start.schema(), &record_batches).unwrap();
 
     let mut columns = record_batch.columns().to_vec();
     if let Some(sort_column) = sort_column {

@@ -23,6 +23,24 @@
 
 Rust implementation of [Apache Iceberg™](https://iceberg.apache.org/).
 
+## ONT3 backport (branch `ont3-0.9.1`)
+
+This branch starts at Apache Iceberg Rust
+[`v0.9.1`](https://github.com/apache/iceberg-rust/releases/tag/v0.9.1)
+(`a78bd0dd02734bf53bec7d47624a5adb4409f1d3`). The tag
+`v0.9.1-ont3.1` carries the 15 Iceberg source files formerly patched under
+`vendor/iceberg` in ONT3 commit `ebb025b05e665216953b2c3f257a3faaee5577b6`.
+All files under `crates/iceberg/src` match that vendor tree byte for byte.
+
+The patch includes the Arrow 57 backport of nested-column projection from
+[apache/iceberg-rust#2635](https://github.com/apache/iceberg-rust/pull/2635),
+together with ONT3's existing field-ID handling, manifest sort-order metadata,
+cancellation propagation, and warehouse path rebasing. ONT3's original
+vendor history starts at `201cbf226695144d14e1b22cc66571c4b3d52a8a` and ends
+at `f6d8d2dacb5a68b01c1de374c11ecee38330d322`. The upstream workspace
+manifest and Iceberg package version remain at `v0.9.1`; ONT3 pins the
+fork commit in Cargo.
+
 ## Components
 
 The Apache Iceberg Rust project is composed of the following components:

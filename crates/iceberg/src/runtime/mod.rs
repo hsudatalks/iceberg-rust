@@ -17,44 +17,19 @@
 
 // This module contains the async runtime abstraction for iceberg.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+pub(crate) use tokio::task::spawn;
 
-use tokio::task;
+use crate::{Error, ErrorKind};
 
-pub struct JoinHandle<T>(task::JoinHandle<T>);
-
-impl<T> Unpin for JoinHandle<T> {}
-
-impl<T: Send + 'static> Future for JoinHandle<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.get_mut() {
-            JoinHandle(handle) => Pin::new(handle)
-                .poll(cx)
-                .map(|r| r.expect("tokio spawned task failed")),
+impl From<tokio::task::JoinError> for Error {
+    fn from(error: tokio::task::JoinError) -> Self {
+        if error.is_panic() {
+            std::panic::resume_unwind(error.into_panic());
         }
+        Error::new(ErrorKind::Unexpected, "Iceberg task was cancelled")
+            .with_retryable(true)
+            .with_source(error)
     }
-}
-
-#[allow(dead_code)]
-pub fn spawn<F>(f: F) -> JoinHandle<F::Output>
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    JoinHandle(task::spawn(f))
-}
-
-#[allow(dead_code)]
-pub fn spawn_blocking<F, T>(f: F) -> JoinHandle<T>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    JoinHandle(task::spawn_blocking(f))
 }
 
 #[cfg(test)]
@@ -62,14 +37,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_tokio_spawn() {
-        let handle = spawn(async { 1 + 1 });
-        assert_eq!(handle.await, 2);
+    async fn cancelled_join_returns_retryable_error() {
+        let task = spawn(std::future::pending::<()>());
+        task.abort();
+        let error = Error::from(task.await.unwrap_err());
+        assert!(error.retryable());
     }
 
+    #[cfg(panic = "unwind")]
     #[tokio::test]
-    async fn test_tokio_spawn_blocking() {
-        let handle = spawn_blocking(|| 1 + 1);
-        assert_eq!(handle.await, 2);
+    #[should_panic(expected = "loader invariant")]
+    async fn joined_task_preserves_its_panic() {
+        let task = spawn(async { panic!("loader invariant") });
+        let join_error = task.await.unwrap_err();
+        let _ = Error::from(join_error);
     }
 }

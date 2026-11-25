@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array as ArrowArray, ArrayRef, Int32Array, RecordBatch, RecordBatchOptions, RunArray,
+    StructArray, new_null_array,
 };
 use arrow_cast::cast;
 use arrow_schema::{
@@ -428,7 +429,7 @@ impl RecordBatchTransformer {
     ///  * If they have different numbers of fields, then we need to modify
     ///    the incoming RecordBatch schema AND columns
     ///  * If they have the same number of fields, but some of them differ in
-    ///    either data type or nullability, then we need to modify the
+    ///    field identity, data type, or nullability, then we need to modify the
     ///    incoming RecordBatch schema AND columns
     ///  * If the schemas differ only in the column names, then we need
     ///    to modify the RecordBatch schema BUT we can keep the
@@ -450,8 +451,14 @@ impl RecordBatchTransformer {
             .iter()
             .zip(target_schema.fields().iter())
         {
+            let ids_differ = source_field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .zip(target_field.metadata().get(PARQUET_FIELD_ID_META_KEY))
+                .is_some_and(|(source_id, target_id)| source_id != target_id);
             if source_field.data_type() != target_field.data_type()
                 || source_field.is_nullable() != target_field.is_nullable()
+                || ids_differ
             {
                 return SchemaComparison::Different;
             }
@@ -610,7 +617,7 @@ impl RecordBatchTransformer {
                     ColumnSource::Promote {
                         target_type,
                         source_index,
-                    } => cast(&*columns[*source_index], target_type)?,
+                    } => Self::promote(&columns[*source_index], target_type)?,
 
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
@@ -618,6 +625,35 @@ impl RecordBatchTransformer {
                 })
             })
             .collect()
+    }
+
+    fn promote(column: &ArrayRef, target: &DataType) -> Result<ArrayRef> {
+        if column.data_type() == target {
+            return Ok(column.clone());
+        }
+        if let (Some(source), DataType::Struct(fields)) =
+            (column.as_any().downcast_ref::<StructArray>(), target)
+        {
+            // Struct promotion projects nested fields by their Iceberg IDs.
+            // Arrow's positional cast cannot fill children added after a file was written.
+            let children = Self::build_field_id_to_arrow_schema_map(&Arc::new(
+                ArrowSchema::new(source.fields().clone()),
+            ))?;
+            let arrays = fields.iter().map(|field| {
+                let id = field.metadata().get(PARQUET_FIELD_ID_META_KEY)
+                    .and_then(|value| value.parse().ok());
+                match id.and_then(|id| children.get(&id)) {
+                    Some((_, index)) => Self::promote(source.column(*index), field.data_type()),
+                    None if field.is_nullable() => Ok(new_null_array(field.data_type(), source.len())),
+                    None => Err(Error::new(ErrorKind::DataInvalid,
+                        format!("required struct child {} is missing", field.name()))),
+                }
+            }).collect::<Result<Vec<_>>>()?;
+            return Ok(Arc::new(StructArray::try_new(
+                fields.clone(), arrays, source.nulls().cloned(),
+            )?));
+        }
+        Ok(cast(column.as_ref(), target)?)
     }
 
     fn create_column(

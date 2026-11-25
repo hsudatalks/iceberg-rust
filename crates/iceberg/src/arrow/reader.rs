@@ -318,7 +318,7 @@ impl ArrowReader {
         let mut parquet_read_options = parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
 
-        let delete_filter_rx =
+        let delete_loader =
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
 
         // Open the Parquet file once, loading its metadata
@@ -461,7 +461,7 @@ impl ArrowReader {
             record_batch_stream_builder = record_batch_stream_builder.with_batch_size(batch_size);
         }
 
-        let delete_filter = delete_filter_rx.await.unwrap()?;
+        let delete_filter = delete_loader.await??;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
         // In addition to the optional predicate supplied in the `FileScanTask`,
@@ -577,6 +577,25 @@ impl ArrowReader {
             };
         }
 
+        if std::env::var_os("ONT3_SCAN_TRACE").is_some() {
+            let meta = record_batch_stream_builder.metadata();
+            let mut remaining = row_selection.clone();
+            let mut groups = 0;
+            let mut kept_pages = 0;
+            let mut all_pages = 0;
+            for (i, group) in meta.row_groups().iter().enumerate() {
+                let keep = selected_row_group_indices.as_ref().is_none_or(|v| v.binary_search(&i).is_ok());
+                groups += usize::from(keep);
+                let rows = if keep { remaining.as_mut().map(|s| s.split_off(group.num_rows() as usize)) } else { None };
+                if let Some(index) = meta.offset_index() {
+                    // Count indexed pages on the leading physical column (the import key).
+                    let pages = &index[i][0].page_locations;
+                    all_pages += pages.len();
+                    if keep { kept_pages += rows.map_or(pages.len(), |r| r.scan_ranges(pages).len()); }
+                }
+            }
+            eprintln!("ont3_parquet file={} groups={}/{} key_pages={}/{}", task.data_file_path,groups,meta.num_row_groups(),kept_pages,all_pages);
+        }
         if let Some(row_selection) = row_selection {
             record_batch_stream_builder =
                 record_batch_stream_builder.with_row_selection(row_selection);
@@ -1780,6 +1799,15 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
+            // Integral rosters are common in keyed point reads. Build once per
+            // predicate and visit each decoded value once instead of allocating
+            // and OR-ing one full-length bitmap per literal.
+            let integers: Option<FnvHashSet<i64>> = literals.iter().map(|datum| {
+                match datum.literal() {
+                    crate::spec::PrimitiveLiteral::Long(value) => Some(*value),
+                    _ => None,
+                }
+            }).collect();
             let literals: Vec<_> = literals
                 .iter()
                 .map(|lit| get_arrow_datum(lit).unwrap())
@@ -1789,6 +1817,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 // update this if arrow ever adds a native is_in kernel
                 let left = project_column(&batch, idx)?;
 
+                if let Some(ids) = &integers
+                    && let Some(values) = left.as_any().downcast_ref::<arrow_array::Int64Array>()
+                {
+                    return Ok(values.iter().map(|id| id.map(|id| ids.contains(&id))).collect());
+                }
                 let mut acc = BooleanArray::from(vec![false; batch.num_rows()]);
                 for literal in &literals {
                     let literal = try_cast_literal(literal, left.data_type())?;
@@ -2317,6 +2350,8 @@ message schema {
     ) -> Vec<Option<String>> {
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
                     .unwrap()
                     .len(),
@@ -2642,6 +2677,8 @@ message schema {
 
         // Task 1: read only the first row group
         let task1 = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             file_size_in_bytes: std::fs::metadata(&file_path).unwrap().len(),
             start: rg0_start,
             length: row_group_0.compressed_size() as u64,
@@ -2660,6 +2697,8 @@ message schema {
 
         // Task 2: read the second and third row groups
         let task2 = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             file_size_in_bytes: std::fs::metadata(&file_path).unwrap().len(),
             start: rg1_start,
             length: file_end - rg1_start,
@@ -2716,8 +2755,8 @@ message schema {
 
         // Verify the actual data values are correct (not just the row count)
         if total_rows_task1 > 0 {
-            let first_batch = &result1[0];
-            let id_col = first_batch
+            let batch_at_start = &result1[0];
+            let id_col = batch_at_start
                 .column(0)
                 .as_primitive::<arrow_array::types::Int32Type>();
             let first_val = id_col.value(0);
@@ -2729,8 +2768,8 @@ message schema {
         }
 
         if total_rows_task2 > 0 {
-            let first_batch = &result2[0];
-            let id_col = first_batch
+            let batch_at_start = &result2[0];
+            let id_col = batch_at_start
                 .column(0)
                 .as_primitive::<arrow_array::types::Int32Type>();
             let first_val = id_col.value(0);
@@ -2789,6 +2828,8 @@ message schema {
         let reader = ArrowReaderBuilder::new(file_io).build();
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/old_file.parquet"))
                     .unwrap()
                     .len(),
@@ -2959,6 +3000,8 @@ message schema {
         let reader = ArrowReaderBuilder::new(file_io).build();
 
         let task = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             file_size_in_bytes: std::fs::metadata(&data_file_path).unwrap().len(),
             start: 0,
             length: 0,
@@ -3179,6 +3222,8 @@ message schema {
 
         // Create FileScanTask that reads ONLY row group 1 via byte range filtering
         let task = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             file_size_in_bytes: std::fs::metadata(&data_file_path).unwrap().len(),
             start: rg1_start,
             length: rg1_length,
@@ -3392,6 +3437,8 @@ message schema {
 
         // Create FileScanTask that reads ONLY row group 1 via byte range filtering
         let task = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             file_size_in_bytes: std::fs::metadata(&data_file_path).unwrap().len(),
             start: rg1_start,
             length: rg1_length,
@@ -3503,6 +3550,8 @@ message schema {
 
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
                     .unwrap()
                     .len(),
@@ -3604,6 +3653,8 @@ message schema {
 
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
                     .unwrap()
                     .len(),
@@ -3694,6 +3745,8 @@ message schema {
 
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
                     .unwrap()
                     .len(),
@@ -3798,6 +3851,8 @@ message schema {
 
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
                     .unwrap()
                     .len(),
@@ -3931,6 +3986,8 @@ message schema {
 
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
                     .unwrap()
                     .len(),
@@ -4031,6 +4088,8 @@ message schema {
 
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
                     .unwrap()
                     .len(),
@@ -4144,6 +4203,8 @@ message schema {
 
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/1.parquet"))
                     .unwrap()
                     .len(),
@@ -4238,6 +4299,8 @@ message schema {
         // Create tasks in a specific order: file_0, file_1, file_2
         let tasks = vec![
             Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_0.parquet"))
                     .unwrap()
                     .len(),
@@ -4256,6 +4319,8 @@ message schema {
                 case_sensitive: false,
             }),
             Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_1.parquet"))
                     .unwrap()
                     .len(),
@@ -4274,6 +4339,8 @@ message schema {
                 case_sensitive: false,
             }),
             Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/file_2.parquet"))
                     .unwrap()
                     .len(),
@@ -4456,6 +4523,8 @@ message schema {
         let reader = ArrowReaderBuilder::new(file_io).build();
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(format!("{table_location}/data.parquet"))
                     .unwrap()
                     .len(),
@@ -4874,6 +4943,8 @@ message schema {
 
         let tasks = Box::pin(futures::stream::iter(
             vec![Ok(FileScanTask {
+                data_sequence_number: None,
+                sort_order_id: None,
                 file_size_in_bytes: std::fs::metadata(&file_path).unwrap().len(),
                 start: 0,
                 length: 0,
@@ -4942,6 +5013,8 @@ message schema {
 
         let file_size = std::fs::metadata(file_path).unwrap().len();
         let task = FileScanTask {
+            data_sequence_number: None,
+            sort_order_id: None,
             file_size_in_bytes: file_size,
             start: 0,
             length: file_size,
